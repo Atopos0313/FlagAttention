@@ -5,19 +5,59 @@
 
 # ruff: noqa: E501
 
+import json
+import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
 import torch
 import triton
 import triton.language as tl
 
 from flag_attn.FLA.compat import libentry, libtuner
-from flag_attn.runtime.backend._thead.FLA.autotune import autotune_configs
 from flag_attn.FLA.index import prepare_chunk_indices
+
+_CONFIG_PATH = Path(__file__).resolve().parents[2] / "tune_configs.yaml"
+
+
+@lru_cache(maxsize=1)
+def _load_tuned_config() -> dict[str, list[dict[str, Any]]]:
+    if not _CONFIG_PATH.is_file():
+        return {}
+    data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Autotune config must be a mapping: {_CONFIG_PATH}")
+    return data
+
+
+def _autotune_configs(kernel_name: str, defaults: list[triton.Config]) -> list[triton.Config]:
+    """Use tune_configs.yaml unless FLAG_ATTN_THEAD_GDR_TUNED_CONFIGS=0."""
+    if os.environ.get("FLAG_ATTN_THEAD_GDR_TUNED_CONFIGS", "1") == "0":
+        return defaults
+    entries = _load_tuned_config().get(kernel_name)
+    if not entries:
+        return defaults
+    configs: list[triton.Config] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{kernel_name}[{index}] must be a mapping")
+        meta = entry.get("META", {})
+        if not isinstance(meta, dict):
+            raise ValueError(f"{kernel_name}[{index}].META must be a mapping")
+        kwargs = {
+            name: entry[name]
+            for name in ("num_warps", "num_stages", "num_ctas", "maxnreg")
+            if name in entry
+        }
+        configs.append(triton.Config(meta, **kwargs))
+    return configs
 
 
 @libentry()
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @libtuner(
-    configs=autotune_configs(
+    configs=_autotune_configs(
         "recompute_w_u_fwd_kernel",
         [
             triton.Config({}, num_warps=num_warps, num_stages=num_stages)
