@@ -5,7 +5,7 @@
 
 https://github.com/vllm-project/vllm/pull/61355
 Only the T-Head packed implementation is timed. This is not CUPTI kernel
-timing or a reproduction of the upstream cold-L2 protocol. Reported times are us.
+timing or a reproduction of the upstream cold-L2 protocol. Reported times are amortized us per update (32 calls per Graph).
 Input construction and correctness checks are local to this file.
 """
 
@@ -24,6 +24,7 @@ STATE_DTYPES = (torch.float32, torch.bfloat16)
 H, HV, K, V = 4, 12, 128, 128
 ROUNDS, REPEAT_ITERS, DRY_RUN_ITERS = 7, 40, 5
 INITIAL_WARMUP, ROUND_WARMUP = 10, 30
+CALLS_PER_GRAPH = 32
 SEED = 1234
 
 
@@ -117,7 +118,7 @@ def _make_calls(data):
     return launch, reference, state, ref_state, out
 
 
-def _capture(launch):
+def _capture(launch, calls=1):
     device = backend.device_fn
     stream = device.Stream()
     stream.wait_stream(device.current_stream())
@@ -126,7 +127,8 @@ def _capture(launch):
     device.synchronize()
     graph = device.CUDAGraph()
     with device.graph(graph, stream=stream):
-        launch()
+        for _ in range(calls):
+            launch()
     device.current_stream().wait_stream(stream)
     device.synchronize()
     return graph
@@ -156,6 +158,24 @@ def _measure(data, record_property):
     graph = _capture(launch)
     _check_updates(graph.replay, reference, state, ref_state, out, initial)
 
+    del graph
+    graph = _capture(launch, calls=CALLS_PER_GRAPH)
+    state.copy_(initial)
+    ref_state.copy_(initial)
+    graph.replay()
+    graph_out, graph_state = out.clone(), state.clone()
+    state.copy_(initial)
+    for _ in range(CALLS_PER_GRAPH):
+        launch()
+        expected_out, expected_state = reference()
+    backend.device_fn.synchronize()
+    assert torch.equal(graph_out, out), "Graph/eager output mismatch"
+    assert torch.equal(graph_state, state), "Graph/eager 32-update state mismatch"
+    _assert_close("Graph output after 32 updates", graph_out, expected_out)
+    _assert_close("Graph state after 32 updates", graph_state, expected_state)
+    assert torch.equal(state[0], initial[0]), "null state slot changed"
+    del graph_out, graph_state
+
     device = backend.device_fn
     events = [(device.Event(enable_timing=True), device.Event(enable_timing=True))
               for _ in range(REPEAT_ITERS)]
@@ -178,7 +198,7 @@ def _measure(data, record_property):
             end.record()
         device.synchronize()
         # Event.elapsed_time returns milliseconds; convert exactly once.
-        samples = [start.elapsed_time(end) * 1000.0 for start, end in events]
+        samples = [start.elapsed_time(end) * 1000.0 / CALLS_PER_GRAPH for start, end in events]
         assert all(math.isfinite(value) and value > 0 for value in samples), samples
         assert torch.isfinite(state).all(), "nonfinite state after timing"
         assert torch.isfinite(out).all(), "nonfinite output after timing"
@@ -190,7 +210,8 @@ def _measure(data, record_property):
     recorder = BenchmarkRecorder(
         record_property, op_name="fused_recurrent_gated_delta_rule_packed_decode",
         dtype="torch.bfloat16", phase="forward", baseline=None,
-        timing_method="device_event", execution_kind="graph_replay",
+        timing_method="device_event", execution_kind="multi_call_graph_replay",
+        latency_scope="amortized_graph_update", calls_per_graph=CALLS_PER_GRAPH,
         cache_protocol="warm_repeated_no_flush", latency_unit="us",
         upstream_protocol_reproduced=False, source="vllm-project/vllm#61355",
         device=backend.get_device_name(), torch_version=torch.__version__, seed=SEED,
@@ -204,7 +225,7 @@ def _measure(data, record_property):
         latency=latency_us, samples_us=samples_by_round, round_medians_us=medians,
         rounds=ROUNDS, samples_per_round=REPEAT_ITERS,
         dry_run_iters=DRY_RUN_ITERS, initial_warmup=INITIAL_WARMUP,
-        round_warmup=ROUND_WARMUP, correctness="eager_and_graph_updates_1_and_10",
+        round_warmup=ROUND_WARMUP, correctness="eager_and_graph_updates_1_10_and_32",
     )
     recorder.record()
     return batch, str(state.dtype).removeprefix("torch."), latency_us
@@ -235,13 +256,13 @@ def benchmark_table(request):
 
     write("")
     write(f"{'B':>4} {'H':>3} {'HV':>3} {'K':>4} {'V':>4} {'QKV':>8} "
-          f"{'State':>8} {'Cache':>6} {'packed_decode(us)':>18}")
-    write("-" * 75)
+          f"{'State':>8} {'packed_decode(us)':>18}")
+    write("-" * 68)
 
     def emit(row):
         batch, state_dtype, us = row
         write(f"{batch:>4} {H:>3} {HV:>3} {K:>4} {V:>4} {'bfloat16':>8} "
-              f"{state_dtype:>8} {'warm':>6} {us:>18.3f}")
+              f"{state_dtype:>8} {us:>18.3f}")
 
     try:
         yield emit

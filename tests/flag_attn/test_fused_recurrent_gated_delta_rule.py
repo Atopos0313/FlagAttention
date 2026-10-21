@@ -48,7 +48,7 @@ def _reference(inputs):
     v, g = v.reshape(-1, HV, V), g.reshape(-1, HV)
     beta = beta.reshape(-1, HV, V) if beta.ndim == 4 else beta.reshape(-1, HV, 1)
     out = torch.zeros_like(v)
-    final = state0.clone() if inputs["inplace_final_state"] else torch.empty(T, HV, V, K)
+    final = state0.clone() if inputs["inplace_final_state"] else torch.empty(B * T, HV, V, K)
     valid = torch.zeros(B * T, dtype=torch.bool)
     written = set()
     accepted = inputs.get("num_accepted_tokens")
@@ -108,6 +108,8 @@ def _check_case_impl(inputs):
     original = inputs["initial_state"].clone()
     actual_o, actual_state = fwd(**inputs)
     test_backend.device_fn.synchronize()
+    assert actual_o.shape == expected_o.shape
+    assert actual_state.shape == expected_state.shape
     actual_flat = actual_o.reshape(-1, *actual_o.shape[-2:])
     expected_flat = expected_o.reshape(actual_flat.shape)
     output_ratio = 0.0
@@ -239,4 +241,35 @@ def test_non_spec_from_vllm_gating_reference(num_reqs, dtype, record_property):
 def test_spec_from_vllm_gating_reference(num_reqs, num_speculative_tokens, dtype, record_property):
     _load_fwd()
     inputs = _make_gating_reference_inputs(num_reqs, dtype, num_speculative_tokens)
+    _check_case(inputs, record_property)
+
+
+@pytest.mark.parametrize("layout", ["fixed-batch2-length3", "packed-lengths1-and3"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@torch.inference_mode()
+def test_non_inplace_returns_every_token_state(layout, dtype, record_property):
+    """Non-inplace output covers all tokens and leaves the state pool intact."""
+    _load_fwd()
+    device = test_backend.device
+    generator = torch.Generator(device=device).manual_seed(0)
+    H, HV = 2, 4
+    if layout == "fixed-batch2-length3":
+        batch, length = 2, 3
+        cu = None
+    else:
+        batch, length = 1, 4
+        cu = torch.tensor([0, 1, 4], device=device, dtype=torch.int32)
+    q = torch.randn(batch, length, H, K, device=device, dtype=dtype, generator=generator)
+    k = torch.randn(batch, length, H, K, device=device, dtype=dtype, generator=generator)
+    v = torch.randn(batch, length, HV, V, device=device, dtype=dtype, generator=generator)
+    g = -torch.rand(batch, length, HV, device=device, dtype=torch.float32, generator=generator)
+    beta = torch.rand(batch, length, HV, device=device, dtype=dtype, generator=generator)
+    state = torch.randn(3, HV, V, K, device=device, dtype=dtype, generator=generator)
+    indices = torch.tensor([1, 2], device=device, dtype=torch.int32)
+    inputs = dict(
+        q=q, k=k, v=v, g=g, beta=beta, scale=K**-0.5,
+        initial_state=state, inplace_final_state=False, cu_seqlens=cu,
+        ssm_state_indices=indices, num_accepted_tokens=None,
+        use_qk_l2norm_in_kernel=True,
+    )
     _check_case(inputs, record_property)

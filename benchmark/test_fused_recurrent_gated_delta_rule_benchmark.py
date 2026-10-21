@@ -24,8 +24,9 @@ HEAD_CONFIGS = ((2, 8, 16), (4, 4, 8))
 HEAD_DIM = 128
 DTYPE = torch.bfloat16
 STATE_DTYPE = torch.bfloat16
-WARMUP = 10
-REPETITIONS = 50
+ROUNDS, REPEAT_ITERS, DRY_RUN_ITERS = 7, 40, 5
+INITIAL_WARMUP, ROUND_WARMUP = 10, 30
+CALLS_PER_GRAPH = 32
 
 def _load_fwd():
     if not test_backend.is_available() or runtime.device.vendor_name != "thead":
@@ -51,7 +52,7 @@ def _reference(inputs):
     v, g = v.reshape(-1, HV, V), g.reshape(-1, HV)
     beta = beta.reshape(-1, HV, V) if beta.ndim == 4 else beta.reshape(-1, HV, 1)
     out = torch.zeros_like(v)
-    final = state0.clone() if inputs["inplace_final_state"] else torch.empty(T, HV, V, K)
+    final = state0.clone() if inputs["inplace_final_state"] else torch.empty(B * T, HV, V, K)
     valid = torch.zeros(B * T, dtype=torch.bool)
     written = set()
     accepted = inputs.get("num_accepted_tokens")
@@ -160,6 +161,65 @@ def _shape_matrix():
     return [(tp, batch, H, HV) for tp, H, HV in HEAD_CONFIGS for batch in BATCHES]
 
 
+def _graph_samples(fwd, inputs, initial):
+    """Amortized warm-cache device time, including Graph device overhead."""
+    device = test_backend.device_fn
+    if not test_backend.graph_available() or not hasattr(device, "Event"):
+        pytest.fail("this benchmark requires T-Head Graph and Event support")
+    state = inputs["initial_state"]
+    for _ in range(INITIAL_WARMUP):
+        fwd(**inputs)
+    stream = device.Stream()
+    stream.wait_stream(device.current_stream())
+    graph = device.CUDAGraph()
+    with device.graph(graph, stream=stream):
+        for _ in range(CALLS_PER_GRAPH):
+            captured_out, _ = fwd(**inputs)
+    device.current_stream().wait_stream(stream)
+    device.synchronize()
+
+    # A replay must perform exactly the same updates as 32 eager calls.
+    state.copy_(initial)
+    graph.replay()
+    graph_out, graph_state = captured_out.clone(), state.clone()
+    state.copy_(initial)
+    for _ in range(CALLS_PER_GRAPH):
+        eager_out, _ = fwd(**inputs)
+    device.synchronize()
+    assert torch.equal(graph_out, eager_out), "Graph/eager output mismatch"
+    assert torch.equal(graph_state, state), "Graph/eager 32-update state mismatch"
+    assert torch.equal(state[0], initial[0]), "null state slot changed"
+    del graph_out, graph_state, eager_out
+
+    events = [(device.Event(enable_timing=True), device.Event(enable_timing=True))
+              for _ in range(REPEAT_ITERS)]
+    for start, end in events:
+        start.record()
+        end.record()
+    device.synchronize()
+    rounds = []
+    for _ in range(ROUNDS):
+        state.copy_(initial)
+        for _ in range(ROUND_WARMUP):
+            fwd(**inputs)
+        for _ in range(DRY_RUN_ITERS):
+            graph.replay()
+        device.synchronize()
+        for start, end in events:
+            start.record()
+            graph.replay()
+            end.record()
+        device.synchronize()
+        samples = [start.elapsed_time(end) * 1000.0 / CALLS_PER_GRAPH
+                   for start, end in events]
+        assert all(math.isfinite(value) and value > 0 for value in samples)
+        assert torch.isfinite(state).all(), "nonfinite state after timing"
+        assert torch.isfinite(captured_out).all(), "nonfinite output after timing"
+        assert torch.equal(state[0], initial[0]), "null state slot changed"
+        rounds.append(samples)
+    return rounds
+
+
 @torch.inference_mode()
 def run_benchmark(record_property, shape):
     shapes = [shape]
@@ -172,16 +232,11 @@ def run_benchmark(record_property, shape):
         inputs = _make_inputs(batch, H, HV)
         pristine = inputs["initial_state"].clone()
         errors = _check_case(inputs)
-        inputs["initial_state"].copy_(pristine)
+        samples_by_round = _graph_samples(fwd, inputs, pristine)
         del pristine
-        samples = test_backend.do_bench(
-            lambda: fwd(**inputs), warmup=WARMUP, rep=REPETITIONS, return_mode="all"
-        )
-        # Backend timers return milliseconds; report microseconds consistently.
-        samples = [value * 1000.0 for value in samples]
-        assert samples and all(math.isfinite(value) and value > 0 for value in samples)
-        assert torch.isfinite(inputs["initial_state"]).all(), "nonfinite state after timing"
-        median = statistics.median(samples)
+        samples = [value for row in samples_by_round for value in row]
+        medians = [statistics.median(row) for row in samples_by_round]
+        median = statistics.median(medians)
         p20, p80 = torch.quantile(torch.tensor(samples), torch.tensor([0.2, 0.8])).tolist()
         detail = dict(TP=tp, B=batch, T=1, H=H, HV=HV, K=HEAD_DIM, V=HEAD_DIM,
                       q_shape=list(inputs["q"].shape), total_tokens=batch,
@@ -194,7 +249,12 @@ def run_benchmark(record_property, shape):
             p20_us=p20, p80_us=p80, latency_unit="us", sample_count=len(samples),
             output_relative_rms=errors[0], state_relative_rms=errors[1],
             timing_protocol="warm_repeated_state_updates",
-            timing_method="device_event" if hasattr(test_backend.device_fn, "Event") else "synchronized_wall",
+            timing_method="device_event", execution_kind="multi_call_graph_replay",
+            cache_protocol="warm_repeated_no_flush", latency_scope="amortized_graph_update",
+            calls_per_graph=CALLS_PER_GRAPH, rounds=ROUNDS, samples_per_round=REPEAT_ITERS,
+            samples_us=samples_by_round, round_medians_us=medians,
+            initial_warmup=INITIAL_WARMUP, round_warmup=ROUND_WARMUP,
+            dry_run_iters=DRY_RUN_ITERS, correctness="cpu_fp32_and_graph_vs_eager_32_updates",
         )
         del inputs
     recorder.record()
