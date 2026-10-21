@@ -20,6 +20,14 @@ import importlib
 
 _OPERATOR_EXPORTS = {
     "chunk_gated_delta_rule": (".FLA.gated_delta_rule", "chunk_gated_delta_rule"),
+    "fused_recurrent_gated_delta_rule_fwd": (
+        ".FLA.gated_delta_rule",
+        "fused_recurrent_gated_delta_rule_fwd",
+    ),
+    "fused_recurrent_gated_delta_rule_packed_decode": (
+        ".FLA.gated_delta_rule",
+        "fused_recurrent_gated_delta_rule_packed_decode",
+    ),
 }
 
 
