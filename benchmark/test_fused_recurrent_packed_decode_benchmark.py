@@ -24,6 +24,8 @@ try:
 except ModuleNotFoundError:
     from recording import BenchmarkRecorder
 
+pytestmark = pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
+
 BATCHES = (1, 2, 4, 8, 16, 32, 64)
 STATE_DTYPES = (torch.bfloat16, torch.float32)
 # Head configurations come from t-head/pla caselist/decode and cover HV/H=2,3,4.

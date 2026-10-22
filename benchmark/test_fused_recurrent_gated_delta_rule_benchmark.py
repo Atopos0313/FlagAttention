@@ -26,6 +26,8 @@ try:
 except ModuleNotFoundError:
     from recording import BenchmarkRecorder
 
+pytestmark = pytest.mark.fused_recurrent_gated_delta_rule_fwd
+
 ASSERT_RATIO = 0.01
 HEAD_DIM = 128
 DTYPE = STATE_DTYPE = torch.bfloat16

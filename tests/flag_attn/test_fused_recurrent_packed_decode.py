@@ -14,6 +14,9 @@ from flag_attn import runtime
 from flag_attn.testing import backend as test_backend
 
 
+pytestmark = pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
+
+
 @pytest.fixture(scope="module")
 def thead_ops():
     if not test_backend.is_available() or runtime.device.vendor_name != "thead":
