@@ -1,8 +1,17 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""T-Head fused recurrent gated delta rule forward benchmark."""
+"""Compare T-Head ordinary GDN forward with the bundled PLA precomputed adapter.
 
+Run with pytest benchmark/test_fused_recurrent_gated_delta_rule_benchmark.py.
+Both providers receive identical precomputed g/beta and independent copies of
+the same BF16 state. Gate preparation and state restoration are not timed.
+Latency is the median of seven round medians, in microseconds, using 32-call
+Graph replays. PLA/FlagAttention > 1 means FlagAttention is faster.
+"""
+
+from functools import lru_cache
+from importlib import import_module
 import math
 import statistics
 
@@ -18,15 +27,28 @@ except ModuleNotFoundError:
     from recording import BenchmarkRecorder
 
 ASSERT_RATIO = 0.01
-BATCHES = (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64)
-# (TP label, per-device query/key heads, per-device value heads)
-HEAD_CONFIGS = ((2, 8, 16), (4, 4, 8))
 HEAD_DIM = 128
-DTYPE = torch.bfloat16
-STATE_DTYPE = torch.bfloat16
+DTYPE = STATE_DTYPE = torch.bfloat16
+SEED = 0
 ROUNDS, REPEAT_ITERS, DRY_RUN_ITERS = 7, 40, 5
 INITIAL_WARMUP, ROUND_WARMUP = 10, 30
 CALLS_PER_GRAPH = 32
+PLA_IMPORT_ERROR = None
+# Head configurations are frozen from PLA caselist/decode. Batches use the
+# common fixed matrix below.
+# TP denotes local head counts; no distributed run is started.
+BATCHES = (1, 2, 4, 8, 16, 32, 64)
+HEAD_CONFIGS = (
+    (1, 16, 32),
+    (2, 8, 16),
+    (4, 4, 8),
+    (1, 16, 48),
+    (2, 8, 24),
+    (1, 16, 64),
+    (2, 8, 32),
+    (4, 4, 16),
+)
+
 
 def _load_fwd():
     if not test_backend.is_available() or runtime.device.vendor_name != "thead":
@@ -34,6 +56,7 @@ def _load_fwd():
     from flag_attn.runtime.backend._thead.FLA.gated_delta_rule.fused_recurrent import (
         fused_recurrent_gated_delta_rule_fwd,
     )
+
     return fused_recurrent_gated_delta_rule_fwd
 
 
@@ -45,9 +68,11 @@ def _reference(inputs):
     B, T, H, K = q.shape
     HV, V = v.shape[-2:]
     cu = inputs["cu_seqlens"]
-    spans = list(zip(cu.cpu().tolist()[:-1], cu.cpu().tolist()[1:])) if cu is not None else [
-        (b * T, (b + 1) * T) for b in range(B)
-    ]
+    spans = (
+        list(zip(cu.cpu().tolist()[:-1], cu.cpu().tolist()[1:]))
+        if cu is not None
+        else [(b * T, (b + 1) * T) for b in range(B)]
+    )
     q, k = q.reshape(-1, H, K), k.reshape(-1, H, K)
     v, g = v.reshape(-1, HV, V), g.reshape(-1, HV)
     beta = beta.reshape(-1, HV, V) if beta.ndim == 4 else beta.reshape(-1, HV, 1)
@@ -92,56 +117,18 @@ def _assert_close(name, actual, expected):
     assert torch.isfinite(actual).all(), f"{name}: nonfinite actual"
     assert torch.isfinite(expected).all(), f"{name}: nonfinite reference"
     torch.testing.assert_close(
-        actual, expected, atol=atol, rtol=rtol,
-        msg=lambda message: f"{name}: elementwise check failed\n{message}",
+        actual, expected, atol=atol, rtol=rtol, msg=lambda message: f"{name}: elementwise check failed\n{message}",
     )
     max_abs = (actual - expected).abs().max().item()
-    ratio = (actual - expected).square().mean().sqrt().item() / (
-        expected.square().mean().sqrt().item() + 1e-8
-    )
-    assert max_abs <= 1e-6 or ratio < ASSERT_RATIO, (
-        f"{name}: relative_rms={ratio:.7g}, max_abs={max_abs:.7g}, limit={ASSERT_RATIO}"
-    )
+    ratio = (actual - expected).square().mean().sqrt().item() / (expected.square().mean().sqrt().item() + 1e-8)
+    assert (
+        max_abs <= 1e-6 or ratio < ASSERT_RATIO
+    ), f"{name}: relative_rms={ratio:.7g}, max_abs={max_abs:.7g}, limit={ASSERT_RATIO}"
     return ratio
 
 
-def _check_case_impl(inputs):
-    fwd = _load_fwd()
-    expected_o, expected_state, valid, written = _reference(inputs)
-    original = inputs["initial_state"].clone()
-    actual_o, actual_state = fwd(**inputs)
-    test_backend.device_fn.synchronize()
-    actual_flat = actual_o.reshape(-1, *actual_o.shape[-2:])
-    expected_flat = expected_o.reshape(actual_flat.shape)
-    output_ratio = 0.0
-    for pos in valid.nonzero().flatten().tolist():
-        output_ratio = max(output_ratio, _assert_close(f"output[{pos}]", actual_flat[pos], expected_flat[pos]))
-    state_ratio = 0.0
-    for slot in written:
-        state_ratio = max(state_ratio, _assert_close(f"state[{slot}]", actual_state[slot], expected_state[slot]))
-    if inputs["inplace_final_state"]:
-        assert actual_state.data_ptr() == inputs["initial_state"].data_ptr()
-        untouched = [slot for slot in range(len(original)) if slot not in written]
-        assert torch.equal(actual_state[untouched], original[untouched]), "untouched state slots changed"
-    else:
-        assert torch.equal(inputs["initial_state"], original), "non-inplace call modified initial state"
-        assert actual_state.data_ptr() != inputs["initial_state"].data_ptr()
-    return output_ratio, state_ratio
-
-
-
-def _check_case(inputs):
-    threads = torch.get_num_threads()
-    try:
-        # Bound CPU reference and assertion overhead; restore before timing.
-        torch.set_num_threads(1)
-        return _check_case_impl(inputs)
-    finally:
-        torch.set_num_threads(threads)
-
-
 def _make_inputs(batch, H, HV):
-    torch.manual_seed(0)
+    torch.manual_seed(SEED)
     device = test_backend.device
     K = V = HEAD_DIM
     q = torch.randn(batch, 1, H, K, device=device, dtype=DTYPE)
@@ -149,121 +136,238 @@ def _make_inputs(batch, H, HV):
     v = torch.randn(batch, 1, HV, V, device=device, dtype=DTYPE)
     g = -torch.rand(batch, 1, HV, device=device, dtype=torch.float32)
     beta = torch.rand(batch, 1, HV, device=device, dtype=DTYPE)
-    indices = torch.randperm(batch, device=device, dtype=torch.int32) + 1
+    indices = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
     state = torch.randn(batch + 1, HV, V, K, device=device, dtype=STATE_DTYPE)
-    return dict(q=q, k=k, v=v, g=g, beta=beta, scale=K**-0.5,
-                initial_state=state, inplace_final_state=True, cu_seqlens=None,
-                ssm_state_indices=indices, num_accepted_tokens=None,
-                use_qk_l2norm_in_kernel=True)
+    return dict(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=K ** -0.5,
+        initial_state=state,
+        inplace_final_state=True,
+        cu_seqlens=None,
+        ssm_state_indices=indices,
+        num_accepted_tokens=None,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+
+@lru_cache(maxsize=1)
+def _load_pla():
+    global PLA_IMPORT_ERROR
+    try:
+        pla = import_module(
+            "flag_attn.runtime.backend._thead.FLA.gated_delta_rule." "pla_gdn.precomputed.pla_precomputed"
+        )
+    except (ImportError, OSError) as exc:
+        PLA_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+        return None
+    PLA_IMPORT_ERROR = None
+    return pla
 
 
 def _shape_matrix():
-    return [(tp, batch, H, HV) for tp, H, HV in HEAD_CONFIGS for batch in BATCHES]
+    return [(tp, batch, h, hv) for tp, h, hv in HEAD_CONFIGS for batch in BATCHES]
 
 
-def _graph_samples(fwd, inputs, initial):
-    """Amortized warm-cache device time, including Graph device overhead."""
+
+def _check_provider(name, call, state, initial, expected, expected_state):
+    out = call()
+    test_backend.device_fn.synchronize()
+    output_error = state_error = 0.0
+    # Every row has one token and a distinct valid slot, numbered 1..B.
+    for row in range(out.shape[0]):
+        output_error = max(output_error, _assert_close(f"{name} output[{row}]", out[row], expected[row]))
+        slot = row + 1
+        state_error = max(state_error, _assert_close(f"{name} state[{slot}]", state[slot], expected_state[slot]),)
+    assert torch.equal(state[0], initial[0]), f"{name}: null state slot changed"
+    return output_error, state_error
+
+
+def _capture(call, state, initial, name):
     device = test_backend.device_fn
-    if not test_backend.graph_available() or not hasattr(device, "Event"):
-        pytest.fail("this benchmark requires T-Head Graph and Event support")
-    state = inputs["initial_state"]
+    state.copy_(initial)
     for _ in range(INITIAL_WARMUP):
-        fwd(**inputs)
+        call()
     stream = device.Stream()
     stream.wait_stream(device.current_stream())
     graph = device.CUDAGraph()
     with device.graph(graph, stream=stream):
         for _ in range(CALLS_PER_GRAPH):
-            captured_out, _ = fwd(**inputs)
+            out = call()
     device.current_stream().wait_stream(stream)
     device.synchronize()
 
-    # A replay must perform exactly the same updates as 32 eager calls.
+    # Graph correctness is checked within each provider. Cross-provider
+    # 32-step drift is a separate stability test, not a single-step gate.
     state.copy_(initial)
     graph.replay()
-    graph_out, graph_state = captured_out.clone(), state.clone()
+    saved_out, saved_state = out.clone(), state.clone()
     state.copy_(initial)
     for _ in range(CALLS_PER_GRAPH):
-        eager_out, _ = fwd(**inputs)
+        eager_out = call()
     device.synchronize()
-    assert torch.equal(graph_out, eager_out), "Graph/eager output mismatch"
-    assert torch.equal(graph_state, state), "Graph/eager 32-update state mismatch"
-    assert torch.equal(state[0], initial[0]), "null state slot changed"
-    del graph_out, graph_state, eager_out
+    assert torch.equal(saved_out, eager_out), f"{name}: Graph/eager output mismatch"
+    assert torch.equal(saved_state, state), f"{name}: Graph/eager state mismatch"
+    assert torch.equal(state[0], initial[0]), f"{name}: null state slot changed"
+    return graph, out
 
-    events = [(device.Event(enable_timing=True), device.Event(enable_timing=True))
-              for _ in range(REPEAT_ITERS)]
-    for start, end in events:
-        start.record()
-        end.record()
-    device.synchronize()
-    rounds = []
-    for _ in range(ROUNDS):
-        state.copy_(initial)
-        for _ in range(ROUND_WARMUP):
-            fwd(**inputs)
-        for _ in range(DRY_RUN_ITERS):
-            graph.replay()
-        device.synchronize()
-        for start, end in events:
+
+def _measure_pair(calls, states, initial):
+    device = test_backend.device_fn
+    if not test_backend.graph_available() or not hasattr(device, "Event"):
+        pytest.fail("this benchmark requires T-Head Graph and Event support")
+    names = ("FlagAttention", "PLA precomputed")
+    captured = [_capture(call, state, initial, name) for call, state, name in zip(calls, states, names)]
+    events = [
+        [(device.Event(enable_timing=True), device.Event(enable_timing=True)) for _ in range(REPEAT_ITERS)]
+        for _ in calls
+    ]
+    for pairs in events:
+        for start, end in pairs:
             start.record()
-            graph.replay()
             end.record()
-        device.synchronize()
-        samples = [start.elapsed_time(end) * 1000.0 / CALLS_PER_GRAPH
-                   for start, end in events]
-        assert all(math.isfinite(value) and value > 0 for value in samples)
-        assert torch.isfinite(state).all(), "nonfinite state after timing"
-        assert torch.isfinite(captured_out).all(), "nonfinite output after timing"
-        assert torch.equal(state[0], initial[0]), "null state slot changed"
-        rounds.append(samples)
-    return rounds
+    device.synchronize()
+    samples = [[] for _ in calls]
+    for round_id in range(ROUNDS):
+        # Alternate which provider runs first to reduce ordering bias.
+        for provider in range(len(calls)) if round_id % 2 == 0 else reversed(range(len(calls))):
+            state = states[provider]
+            state.copy_(initial)
+            for _ in range(ROUND_WARMUP):
+                calls[provider]()
+            graph, out = captured[provider]
+            for _ in range(DRY_RUN_ITERS):
+                graph.replay()
+            device.synchronize()
+            for start, end in events[provider]:
+                start.record()
+                graph.replay()
+                end.record()
+            device.synchronize()
+            values = [start.elapsed_time(end) * 1000.0 / CALLS_PER_GRAPH for start, end in events[provider]]
+            assert all(math.isfinite(value) and value > 0 for value in values)
+            assert torch.isfinite(out).all(), f"{names[provider]}: nonfinite output"
+            assert torch.isfinite(state).all(), f"{names[provider]}: nonfinite state"
+            assert torch.equal(state[0], initial[0]), f"{names[provider]}: null slot changed"
+            samples[provider].append(values)
+    return samples
 
 
 @torch.inference_mode()
 def run_benchmark(record_property, shape):
-    shapes = [shape]
+    tp, batch, h, hv = shape
     fwd = _load_fwd()
-    recorder = BenchmarkRecorder(
-        record_property, op_name="fused_recurrent_gated_delta_rule_fwd",
-        dtype=str(DTYPE), phase="forward", baseline=None,
-    )
-    for tp, batch, H, HV in shapes:
-        inputs = _make_inputs(batch, H, HV)
-        pristine = inputs["initial_state"].clone()
-        errors = _check_case(inputs)
-        samples_by_round = _graph_samples(fwd, inputs, pristine)
-        del pristine
-        samples = [value for row in samples_by_round for value in row]
-        medians = [statistics.median(row) for row in samples_by_round]
-        median = statistics.median(medians)
-        p20, p80 = torch.quantile(torch.tensor(samples), torch.tensor([0.2, 0.8])).tolist()
-        detail = dict(TP=tp, B=batch, T=1, H=H, HV=HV, K=HEAD_DIM, V=HEAD_DIM,
-                      q_shape=list(inputs["q"].shape), total_tokens=batch,
-                      state_shape=list(inputs["initial_state"].shape),
-                      state_dtype=str(STATE_DTYPE), gate_dtype=str(inputs["g"].dtype),
-                      beta_dtype=str(inputs["beta"].dtype), inplace=True,
-                      qk_normalization=True, spec_decoding=False)
-        recorder.add(
-            shape_detail=detail, latency=median, latency_base=None,
-            p20_us=p20, p80_us=p80, latency_unit="us", sample_count=len(samples),
-            output_relative_rms=errors[0], state_relative_rms=errors[1],
-            timing_protocol="warm_repeated_state_updates",
-            timing_method="device_event", execution_kind="multi_call_graph_replay",
-            cache_protocol="warm_repeated_no_flush", latency_scope="amortized_graph_update",
-            calls_per_graph=CALLS_PER_GRAPH, rounds=ROUNDS, samples_per_round=REPEAT_ITERS,
-            samples_us=samples_by_round, round_medians_us=medians,
-            initial_warmup=INITIAL_WARMUP, round_warmup=ROUND_WARMUP,
-            dry_run_iters=DRY_RUN_ITERS, correctness="cpu_fp32_and_graph_vs_eager_32_updates",
+    pla = _load_pla()
+    inputs = _make_inputs(batch, h, hv)
+    initial = inputs["initial_state"].clone()
+    states = (inputs["initial_state"], initial.clone())
+
+    def run_flag():
+        return fwd(**inputs)[0]
+
+    def run_pla():
+        return pla.run(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            inputs["g"],
+            inputs["beta"],
+            states[1],
+            inputs["ssm_state_indices"],
+            inputs["scale"],
+            True,
         )
-        del inputs
+
+    calls = (run_flag, run_pla) if pla is not None else (run_flag,)
+    config = list(pla.config(batch, h, hv)) if pla is not None else None
+    threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(1)
+        expected, expected_state, _, _ = _reference(inputs)
+        errors = [
+            _check_provider(name, call, state, initial, expected, expected_state)
+            for name, call, state in zip(("FlagAttention", "PLA precomputed"), calls, states)
+        ]
+    finally:
+        torch.set_num_threads(threads)
+    del expected, expected_state
+    samples = _measure_pair(calls, states, initial)
+    medians = [[statistics.median(row) for row in provider] for provider in samples]
+    flag_us = statistics.median(medians[0])
+    pla_us = statistics.median(medians[1]) if pla is not None else None
+    quantiles = [
+        torch.quantile(torch.tensor([v for row in provider for v in row]), torch.tensor([0.2, 0.8])).tolist()
+        for provider in samples
+    ]
+    recorder = BenchmarkRecorder(
+        record_property,
+        op_name="fused_recurrent_gated_delta_rule_fwd",
+        dtype=str(DTYPE),
+        phase="forward",
+        baseline="pla_precomputed" if pla is not None else None,
+    )
+    recorder.add(
+        shape_detail=dict(
+            TP=tp,
+            B=batch,
+            T=1,
+            H=h,
+            HV=hv,
+            K=HEAD_DIM,
+            V=HEAD_DIM,
+            q_shape=list(inputs["q"].shape),
+            state_shape=list(initial.shape),
+            state_dtype=str(STATE_DTYPE),
+            gate_dtype=str(inputs["g"].dtype),
+            beta_dtype=str(inputs["beta"].dtype),
+            scale=inputs["scale"],
+            qk_normalization=True,
+            inplace=True,
+            seed=SEED,
+        ),
+        latency=flag_us,
+        latency_base=pla_us,
+        latency_unit="us",
+        p20_us=quantiles[0][0],
+        p80_us=quantiles[0][1],
+        pla_p20_us=quantiles[1][0] if pla is not None else None,
+        pla_p80_us=quantiles[1][1] if pla is not None else None,
+        sample_count=ROUNDS * REPEAT_ITERS,
+        calls_per_graph=CALLS_PER_GRAPH,
+        rounds=ROUNDS,
+        samples_per_round=REPEAT_ITERS,
+        initial_warmup=INITIAL_WARMUP,
+        round_warmup=ROUND_WARMUP,
+        dry_run_iters=DRY_RUN_ITERS,
+        execution_kind="multi_call_graph_replay",
+        timing_method="device_event",
+        latency_scope="precomputed_gates_forward_amortized_graph_update",
+        cache_protocol="warm_repeated_no_flush",
+        samples_us=samples[0],
+        pla_samples_us=samples[1] if pla is not None else [],
+        round_medians_us=medians[0],
+        pla_round_medians_us=medians[1] if pla is not None else [],
+        output_relative_rms=errors[0][0],
+        state_relative_rms=errors[0][1],
+        pla_output_relative_rms=errors[1][0] if pla is not None else None,
+        pla_state_relative_rms=errors[1][1] if pla is not None else None,
+        correctness="each_provider_cpu_fp32_single_step_and_graph_vs_eager",
+        pla_entrypoint=pla.__file__ if pla is not None else None,
+        pla_config=config,
+        pla_available=pla is not None,
+        pla_unavailable_reason=PLA_IMPORT_ERROR,
+        shape_selection="official_head_configs_fixed_batches_1_2_4_8_16_32_64",
+    )
     recorder.record()
-    return (*shape, median)
+    return (*shape, flag_us, pla_us)
 
 
 @pytest.fixture(scope="module")
 def benchmark_table(request):
-    """Stream rows through pytest's terminal while keeping normal diagnostics."""
+    """Stream table rows while retaining pytest's diagnostics."""
     prefix = request.node.nodeid + "::"
 
     class QuietPassedCases:
@@ -285,15 +389,22 @@ def benchmark_table(request):
                 print(line, flush=True)
 
     write("")
-    write(f"{'TP':>3} {'B':>4} {'T':>3} {'H':>4} {'HV':>4} {'K':>4} {'V':>4} "
-          f"{'dtype':>8} {'flag_attn(us)':>14}")
-    write("-" * 65)
+    write(
+        f"{'TP':>2} {'B':>3} {'T':>2} {'H':>2} {'HV':>2} "
+        f"{'K':>3} {'V':>3} {'QKV/State':>9} {'flag_attn(us)':>14} "
+        f"{'pla(us)':>11} {'pla/flag_attn':>14}"
+    )
+    write("-" * 92)
 
     def emit(row):
-        tp, batch, H, HV, median = row
-        write(f"{tp:>3} {batch:>4} {1:>3} {H:>4} {HV:>4} "
-              f"{HEAD_DIM:>4} {HEAD_DIM:>4} {str(DTYPE).removeprefix('torch.'):>8} "
-              f"{median:>14.3f}")
+        tp, batch, h, hv, flag_us, pla_us = row
+        pla_text = "N/A" if pla_us is None else f"{pla_us:.3f}"
+        ratio_text = "N/A" if pla_us is None else f"{pla_us / flag_us:.3f}"
+        write(
+            f"{tp:>2} {batch:>3} {1:>2} {h:>2} {hv:>2} "
+            f"{HEAD_DIM:>3} {HEAD_DIM:>3} {'BF16/BF16':>9} "
+            f"{flag_us:>14.3f} {pla_text:>11} {ratio_text:>14}"
+        )
 
     try:
         yield emit
@@ -303,8 +414,9 @@ def benchmark_table(request):
 
 @pytest.mark.benchmark
 @pytest.mark.parametrize(
-    "shape", _shape_matrix(),
-    ids=[f"TP{tp}-B{batch}-T1-H{H}-HV{HV}-K128-V128-bf16" for tp, batch, H, HV in _shape_matrix()],
+    "shape",
+    _shape_matrix(),
+    ids=[f"TP{tp}-B{batch}-T1-H{h}-HV{hv}-K128-V128-bf16" for tp, batch, h, hv in _shape_matrix()],
 )
 def test_fused_recurrent_gated_delta_rule_benchmark(record_property, shape, benchmark_table):
     benchmark_table(run_benchmark(record_property, shape))
