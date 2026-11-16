@@ -1,3 +1,5 @@
+# Copyright 2026 FlagOS Contributors
+
 """Public Forgetting Attention exports."""
 import importlib
 
