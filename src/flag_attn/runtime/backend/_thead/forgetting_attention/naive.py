@@ -28,7 +28,6 @@ limitations under the License.
 # 6a71b9ebef4dbfaf489ca32fb4ad32ed51a3dc474b6d681c21ddf026eef1b5d2
 # This forward-only extraction retains the original forward operations and
 # launch configuration. Loads use .ca for legal 4/8/16-byte async copies.
-# T-Head uses the validated portable forward tile configuration below.
 # Backward and standalone upstream tests are excluded.
 import math
 from collections import defaultdict
@@ -296,11 +295,6 @@ def forgetting_attention(
 
 def get_fwd_config(B, H, M, N, D, causal):
     assert causal
-    from flag_attn import runtime
-
-    if runtime.device.vendor_name == "thead":
-        # Use explicit PPU settings rather than its CUDA-compatibility SM value.
-        return (64, 32, 3, 4) if D <= 64 else (128, 32, 4, 4)
     if torch.cuda.get_device_capability() == (8, 0):
         if D <= 64:
             BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 32, 3, 4
