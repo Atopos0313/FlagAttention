@@ -64,36 +64,11 @@ def _scalar_threshold(device_index, batch, heads, value):
 
 
 @triton.jit
-def _prepare_kernel(
-    X,
-    L,
-    S,
-    THR,
-    XB: tl.constexpr,
-    XH: tl.constexpr,
-    XT: tl.constexpr,
-    TB: tl.constexpr,
-    TH: tl.constexpr,
-    H: tl.constexpr,
-    N: tl.constexpr,
-    C: tl.constexpr,
-    LOGC: tl.constexpr,
-    NQ: tl.constexpr,
-    NK: tl.constexpr,
-    M: tl.constexpr,
-    BN: tl.constexpr,
-    QM: tl.constexpr,
-):
-    h = tl.program_id(0)
-    b = tl.program_id(1)
+def _prepare_kernel(X, L, XB: tl.constexpr, XH: tl.constexpr, XT: tl.constexpr,
+                    H: tl.constexpr, N: tl.constexpr, C: tl.constexpr, LOGC: tl.constexpr):
+    h, b = tl.program_id(0), tl.program_id(1)
     i = tl.arange(0, C)
-    qi = tl.arange(0, NQ)
-    ki = tl.arange(0, NK)
-    anchor = tl.full((NQ,), 0, tl.float32)
-    ends = tl.full((NK,), 0, tl.float32)
     carry = tl.full((), 0, tl.float32)
-    pos_q = N - M + qi * QM
-    pos_k = tl.minimum(ki * BN + BN - 1, N - 1)
     for chunk in range(tl.cdiv(N, C)):
         t = chunk * C + i
         x = tl.load(X + b * XB + h * XH + t * XT, t < N, other=0)
@@ -104,31 +79,15 @@ def _prepare_kernel(
             x = tl.where(i & 1 << m != 0, libdevice.add_rn(x, left), x)
         tl.store(L + (b * H + h) * N + t, x, t < N)
         carry = tl.sum(tl.where(i == C - 1, x, 0), 0)
-        av = tl.gather(x, pos_q % C, axis=0)
-        ev = tl.gather(x, pos_k % C, axis=0)
-        anchor = tl.where(pos_q // C == chunk, av, anchor)
-        ends = tl.where(pos_k // C == chunk, ev, ends)
-    threshold = tl.load(THR + b * TB + h * TH)
-    old = (ki[None, :] < tl.cdiv(N, BN)) & (anchor[:, None] - ends[None, :] < threshold)
-    starts = tl.sum(old.to(tl.int32), 1) * BN
-    tl.store(S + (b * H + h) * tl.cdiv(M, QM) + qi, starts, qi < tl.cdiv(M, QM))
 
 
 @triton.jit
-def _general_starts(
-    P, T, S, M: tl.constexpr, N: tl.constexpr, H: tl.constexpr, BN: tl.constexpr, QM: tl.constexpr, NK: tl.constexpr
-):
-    h, b, group = (tl.program_id(0), tl.program_id(1), tl.program_id(2))
-    r = group * 16 + tl.arange(0, 16)
+def _prune_start(P, T, anchor, N: tl.constexpr, BN: tl.constexpr, NK: tl.constexpr):
     j = tl.arange(0, NK)
-    pp = P + (b * H + h) * N
-    a = tl.load(pp + N - M + r * QM, r < tl.cdiv(M, QM), other=0)
-    end = tl.minimum(j * BN + BN - 1, N - 1)
-    e = tl.load(pp + end, j < tl.cdiv(N, BN), other=0)
+    ends = tl.load(P + tl.minimum((j + 1) * BN - 1, N - 1), j < tl.cdiv(N, BN), other=0)
     threshold = tl.load(T)
-    old = (j[None, :] < tl.cdiv(N, BN)) & (a[:, None] - e[None, :] < threshold)
-    starts = tl.sum(old.to(tl.int32), 1) * BN
-    tl.store(S + (b * H + h) * tl.cdiv(M, QM) + r, starts, r < tl.cdiv(M, QM))
+    old = (j < tl.cdiv(N, BN)) & (anchor - ends < threshold)
+    return tl.sum(old.to(tl.int32), 0) * BN
 
 
 @triton.jit
@@ -148,6 +107,8 @@ def _parallel_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     STAGES: tl.constexpr,
+    NK: tl.constexpr,
+    QM: tl.constexpr,
 ):
     dtype = O.dtype.element_ty
     h, b, mblock = (tl.program_id(0), tl.program_id(1), tl.program_id(2))
@@ -155,10 +116,10 @@ def _parallel_kernel(
     rm = mblock * BM + tl.arange(0, BM)
     rn = tl.arange(0, BN)
     rd = tl.arange(0, D)
-    q = tl.load(Q + ((b * M + rm[:, None]) * H + h) * D + rd[None, :], rm[:, None] < M, other=0, cache_modifier=".ca")
     pp = PREFIX + (b * H + h) * N
     gq = tl.load(pp + N - M + rm, rm < M, other=0, cache_modifier=".ca")
-    lo = tl.load(STARTS + (b * H + h) * tl.cdiv(M, BM) + mblock)
+    anchor = tl.load(pp + N - M + mblock * BM // QM * QM)
+    lo = _prune_start(pp, STARTS, anchor, N, BN, NK)
     lo = lo // BN * BN
     hi = tl.minimum(N, N - M + (mblock + 1) * BM)
     mi = tl.full((BM,), -float("inf"), tl.float32)
@@ -166,7 +127,8 @@ def _parallel_kernel(
     acc = tl.zeros((BM, D), tl.float32)
     log2e: tl.constexpr = 1.4426950408889634
     scale = sm_scale * log2e
-    for start in tl.range(lo, hi, BN, num_stages=STAGES):
+    for start in tl.range(lo, hi, BN, num_stages=STAGES, disable_licm=True):
+        q = tl.load(Q + ((b * M + rm[:, None]) * H + h) * D + rd[None, :], rm[:, None] < M, other=0, cache_modifier=".ca")
         kn = start + rn
         k = tl.load(
             K + ((b * N + kn[None, :]) * HK + hk) * D + rd[:, None], kn[None, :] < N, other=0, cache_modifier=".ca"
@@ -206,6 +168,7 @@ def _decode_kernel(
     HK: tl.constexpr,
     D: tl.constexpr,
     BN: tl.constexpr,
+    NK: tl.constexpr,
 ):
     dtype = O.dtype.element_ty
     h, b = (tl.program_id(0), tl.program_id(1))
@@ -215,7 +178,7 @@ def _decode_kernel(
     q = tl.load(Q + (b * H + h) * D + rd[None, :], cache_modifier=".ca")
     pp = PREFIX + (b * H + h) * N
     gq = tl.load(pp + N - 1, cache_modifier=".ca")
-    lo = tl.load(STARTS + b * H + h)
+    lo = _prune_start(pp, STARTS, gq, N, BN, NK)
     mi = tl.full((1,), -float("inf"), tl.float32)
     li = tl.zeros((1,), tl.float32)
     acc = tl.zeros((1, D), tl.float32)
@@ -433,46 +396,27 @@ def _find_starts_kernel(
         log_lambda_out_ptr += stride_log_lambda_n * BLOCK_M
 
 
+def _ceil_div(x, y):
+    return (x + y - 1) // y
+
+
 _prepare_launch = _LaunchCache(_prepare_kernel)
-_starts_launch = _LaunchCache(_general_starts)
 _parallel_launch = _LaunchCache(_parallel_kernel)
 _decode_launch = _LaunchCache(_decode_kernel)
 
 
 def _prepare_prefix(gate, threshold, m, bn, bm):
     b, h, n = gate.shape
-    starts = torch.empty((b, h, triton.cdiv(m, bm)), device=gate.device, dtype=torch.int32)
     if b * h > 1 and torch.__version__.startswith("2.10."):
-        # Match the reference Torch 2.10 prefix accumulation tree exactly.
         ln, lr = (n - 1).bit_length(), (b * h - 1).bit_length()
         chunk = 2 * (1 << min(9, max(4, (9 + ln - lr) // 2)))
         prefix = torch.empty((b, h, n), device=gate.device, dtype=torch.float32)
-        args = (
-            gate,
-            prefix,
-            starts,
-            threshold,
-            *gate.stride(),
-            *threshold.stride(),
-            h,
-            n,
-            chunk,
-            chunk.bit_length() - 1,
-            triton.next_power_of_2(triton.cdiv(m, bm)),
-            triton.next_power_of_2(triton.cdiv(n, bn)),
-            m,
-            bn,
-            bm,
-        )
-        key = (gate.device.index, b, gate.data_ptr() % 16, args[4:])
+        args = (gate, prefix, *gate.stride(), h, n, chunk, chunk.bit_length() - 1)
+        key = (gate.device.index, b, gate.data_ptr() % 16, args[2:])
         _prepare_launch(key, (h, b), args, dict(num_warps=4))
     else:
         prefix = torch.cumsum(gate, dim=-1, dtype=torch.float32)
-        args = (prefix, threshold, starts, m, n, h, bn, bm, triton.next_power_of_2(triton.cdiv(n, bn)))
-        _starts_launch(
-            (gate.device.index, b, args[3:]), (h, b, triton.cdiv(triton.cdiv(m, bm), 16)), args, dict(num_warps=4)
-        )
-    return prefix, starts
+    return prefix, threshold
 
 
 def _supports_optimized(q, k, v, gate, head_first, seq_start, scale, threshold):
@@ -490,9 +434,10 @@ def _optimized_forward(q, k, v, gate, sm_scale, threshold):
     n, hk = k.shape[1:3]
     scale = 1.0 / math.sqrt(real_d) if sm_scale is None else sm_scale
     # Match the PPU reference's reduction grouping, including decode rounding.
-    bm = 1 if m == 1 else (64 if real_d <= 64 else 128)
+    qm = 1 if m == 1 else (64 if real_d <= 64 else 128)
+    bm = 1 if m == 1 else 64
     bn = min(128, max(16, triton.next_power_of_2(n))) if m == 1 else 32
-    stages = 1 if m == 1 else (3 if real_d <= 64 else 4)
+    stages = 1 if m == 1 else 2
     thr = _scalar_threshold(q.device.index, b, h, float(threshold))
     prefix, starts = _prepare_prefix(gate.transpose(1, 2), thr, m, bn, bm)
     d = triton.next_power_of_2(real_d)
@@ -502,13 +447,13 @@ def _optimized_forward(q, k, v, gate, sm_scale, threshold):
     args = (q, k, v, prefix, starts, out, scale)
     key = (q.device.index, q.dtype, b, m, n, h, hk, d, bm, bn, type(scale), float(scale))
     if m == 1:
-        _decode_launch(key, (h, b), args, dict(N=n, H=h, HK=hk, D=d, BN=bn, num_warps=4, num_stages=1))
+        _decode_launch(key, (h, b), args, dict(N=n, H=h, HK=hk, D=d, BN=bn, NK=triton.next_power_of_2(_ceil_div(n, bn)), num_warps=4, num_stages=1))
     else:
         _parallel_launch(
             key,
-            (h, b, triton.cdiv(m, bm)),
+            (h, b, _ceil_div(m, bm)),
             args,
-            dict(M=m, N=n, H=h, HK=hk, D=d, BM=bm, BN=bn, STAGES=stages, num_warps=4, num_stages=stages),
+            dict(M=m, N=n, H=h, HK=hk, D=d, BM=bm, BN=bn, NK=triton.next_power_of_2(_ceil_div(n, bn)), STAGES=stages, QM=qm, num_warps=4, num_stages=stages),
         )
     return out if d == real_d else out[..., :real_d].contiguous()
 
@@ -544,7 +489,7 @@ class _OrdinaryForward(torch.autograd.Function):
         starts = None
         start_strides = (0, 0, 0)
         if threshold is not None:
-            starts = torch.empty((b, h, triton.cdiv(m, bm)), device=q.device, dtype=torch.long)
+            starts = torch.empty((b, h, _ceil_div(m, bm)), device=q.device, dtype=torch.long)
             start_strides = starts.stride()
             _find_starts_kernel[(h, b)](
                 prefix,
@@ -562,7 +507,7 @@ class _OrdinaryForward(torch.autograd.Function):
                 num_warps=1,
             )
         out = torch.empty_like(q)
-        _ordinary_kernel[(triton.cdiv(m, bm), h, b)](
+        _ordinary_kernel[(_ceil_div(m, bm), h, b)](
             q,
             k,
             v,
